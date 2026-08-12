@@ -31,6 +31,11 @@ import yaml
 from pmb.core.events import Event
 from pmb.security.redact import redact, redact_metadata
 
+# Commits walked in a single sync when the caller does not say otherwise.
+# Kept as the default (not a hard limit) so an explicit `--days`/`--max-commits`
+# can ask for more; see `capture_recent_commits`.
+DEFAULT_MAX_COMMITS = 100
+
 if TYPE_CHECKING:
     from pmb.core.engine import Engine
 
@@ -121,9 +126,15 @@ def _commit_files_stat(path: Path, sha: str) -> dict:
 def capture_recent_commits(
     repo_path: Path,
     since_timestamp: float | None = None,
-    max_commits: int = 100,
+    max_commits: int | None = DEFAULT_MAX_COMMITS,
 ) -> list[CommitInfo]:
-    """Capture commits since the given date (or the last week by default)."""
+    """Capture commits since the given date (or the last week by default).
+
+    `max_commits` caps how many commits a single walk returns. Pass ``0`` (or
+    any value <= 0, or ``None``) for no cap - useful with an explicit
+    ``--days`` window, where a silent cap would drop history the caller
+    explicitly asked for.
+    """
     if not _is_git_repo(repo_path):
         return []
 
@@ -138,10 +149,16 @@ def capture_recent_commits(
 
     # Format: hash, short_hash, author, unix_ts, subject, body
     fmt = "%H%x09%h%x09%an%x09%at%x09%s%x09%b%x1e"
+    log_args = ["log", f"--since={since_arg}"]
+    # Omit -n entirely when uncapped; `git log -0` returns nothing.
+    if max_commits and max_commits > 0:
+        log_args.append(f"-{max_commits}")
+    log_args += [f"--pretty=format:{fmt}", "--no-merges"]
+    # An uncapped walk over a long window can outlast the default 10s budget.
     rc, out, _ = _run_git(
-        ["log", f"--since={since_arg}", f"-{max_commits}",
-         f"--pretty=format:{fmt}", "--no-merges"],
+        log_args,
         repo_path,
+        timeout=10 if (max_commits and max_commits > 0) else 120,
     )
     if rc != 0 or not out.strip():
         return []
@@ -228,11 +245,19 @@ class GitSync:
                 shas.add(sha)
         return shas
 
-    def sync(self, since_timestamp: float | None = None) -> dict:
+    def sync(
+        self,
+        since_timestamp: float | None = None,
+        max_commits: int | None = None,
+    ) -> dict:
         """
         Capture git commits since last_sync (or since_timestamp if provided).
 
-        Returns: {"captured": int, "skipped_existing": int, "branch": str}
+        `max_commits` caps how many commits a single run walks. ``None`` uses
+        the module default; ``0`` (or negative) means no cap.
+
+        Returns: {"captured": int, "skipped_existing": int, "branch": str,
+                  "cap_reached": bool}
         """
         repo = self.engine.workspace.root
         if not _is_git_repo(repo):
@@ -245,7 +270,15 @@ class GitSync:
                 # Overlap window so commits at the boundary still reach SHA dedup
                 since_timestamp = since_timestamp - 3600
 
-        commits = capture_recent_commits(repo, since_timestamp=since_timestamp)
+        if max_commits is None:
+            max_commits = DEFAULT_MAX_COMMITS
+        commits = capture_recent_commits(
+            repo, since_timestamp=since_timestamp, max_commits=max_commits,
+        )
+        # A full page means git had at least this many in the window, so there
+        # are probably more we did not walk. Surfaced so the caller can say so
+        # instead of silently truncating the user's --days window.
+        cap_reached = bool(max_commits) and max_commits > 0 and len(commits) >= max_commits
         existing = self.already_imported_shas()
 
         captured = 0
@@ -300,6 +333,8 @@ class GitSync:
             "skipped_existing": skipped,
             "branch": _current_branch(repo),
             "latest_commit_timestamp": latest_ts,
+            "cap_reached": cap_reached,
+            "max_commits": max_commits,
         }
 
     @staticmethod

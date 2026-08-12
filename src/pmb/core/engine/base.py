@@ -325,11 +325,21 @@ class Engine(
             "current_session": sess.to_dict() if sess else None,
         }
 
-    def sync_git(self, since_timestamp: float | None = None) -> dict:
-        """Capture git commits into memory. Imported lazily."""
+    def sync_git(
+        self,
+        since_timestamp: float | None = None,
+        max_commits: int | None = None,
+    ) -> dict:
+        """Capture git commits into memory. Imported lazily.
+
+        `max_commits` caps a single walk; ``None`` uses the signal default and
+        ``0`` means uncapped.
+        """
         from pmb.signals.git import GitSync
 
-        return GitSync(self).sync(since_timestamp=since_timestamp)
+        return GitSync(self).sync(
+            since_timestamp=since_timestamp, max_commits=max_commits,
+        )
 
     def session_start(self, name: str | None = None) -> dict:
         return self.session_tracker.start(name).to_dict()

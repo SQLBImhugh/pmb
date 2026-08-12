@@ -28,6 +28,44 @@ _HOOK_MARKER = "# >>> PMB track (pmb track install) >>>"
 _HOOK_END = "# <<< PMB track <<<"
 
 
+def _splice_block(existing: str, block: str) -> tuple[str, bool]:
+    """Insert `block` into an existing hook script so it actually runs.
+
+    Appending at the end is wrong whenever the script terminates itself first.
+    A hook ending in a top-level ``exit 0`` - the usual way to make a hook
+    fail-open - would leave an appended block permanently unreachable, and the
+    install would still report success.
+
+    So: splice above the first *unconditional, top-level* terminator. Only a
+    line beginning at column 0 with ``exit``/``exec`` qualifies; an indented
+    ``exit`` (inside ``if``/``while``) or a guard such as
+    ``[ -z "$ROOT" ] && exit 0`` is conditional, still allows the rest of the
+    script to run, and must not be treated as the end.
+
+    Returns (new_text, inserted_above_exit).
+    """
+    lines = existing.splitlines()
+    terminator_at = None
+    for i, line in enumerate(lines):
+        stripped = line.rstrip()
+        # Column-0 only: anything indented is inside a construct, so reaching it
+        # is conditional and code after it is not necessarily dead.
+        if stripped != line.lstrip():
+            continue
+        first = stripped.split("#", 1)[0].strip()
+        if first == "exit" or first.startswith(("exit ", "exec ")):
+            terminator_at = i
+            break
+
+    if terminator_at is None:
+        return existing.rstrip("\n") + "\n\n" + block, False
+
+    head = "\n".join(lines[:terminator_at]).rstrip("\n")
+    tail = "\n".join(lines[terminator_at:])
+    return f"{head}\n\n{block}\n{tail}\n", True
+
+
+
 @track_app.command("changes")
 def track_changes_cmd(
     path: str = typer.Argument(".", help="Path inside the git repo (default: current dir)."),
@@ -176,11 +214,18 @@ def track_install_cmd(
             console.print("[yellow]Already installed[/] - PMB block present in post-commit hook.")
             return
         # Respect the user's existing hook: append our block rather than clobber.
-        new = existing.rstrip("\n") + "\n\n" + block
+        # Appending blindly is not enough - a hook that ends in an unconditional
+        # `exit` (very common) would leave our block as unreachable dead code
+        # while we report success. Insert above the first such terminator.
+        new, inserted_above_exit = _splice_block(existing, block)
         hook.write_text(new, encoding="utf-8")
+        note = (
+            "\n  [yellow]inserted above the hook's `exit` line[/] so it is reachable"
+            if inserted_above_exit else ""
+        )
         console.print(Panel.fit(
             "[green]Appended[/] PMB track to your existing post-commit hook\n"
-            f"  {hook}",
+            f"  {hook}{note}",
             title="PMB · track install",
         ))
     else:

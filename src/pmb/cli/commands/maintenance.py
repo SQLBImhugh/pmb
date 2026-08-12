@@ -160,6 +160,11 @@ def migrate_workspaces(
 def sync(
     days: int | None = typer.Option(None, "--days",
                                        help="Sync commits from last N days (default: since last sync)"),
+    max_commits: int | None = typer.Option(
+        None, "--max-commits",
+        help="Cap commits walked in one run (default 100). Use 0 for no cap - "
+             "recommended with a wide --days window.",
+    ),
 ):
     """Capture git commits into memory."""
     eng = Engine()
@@ -167,7 +172,7 @@ def sync(
     if days:
         since = time.time() - days * 86400
 
-    result = eng.sync_git(since_timestamp=since)
+    result = eng.sync_git(since_timestamp=since, max_commits=max_commits)
     if result.get("error"):
         console.print(f"[red]{result['error']}[/]")
         return
@@ -180,6 +185,15 @@ def sync(
         f"captured: [bold]{captured}[/], skipped (already imported): {skipped}, "
         f"branch: [cyan]{branch}[/]"
     )
+    # Silently truncating an explicit --days window is the bug this warns about:
+    # the walk stopped at the cap, so older commits in the window were skipped.
+    if result.get("cap_reached"):
+        cap = result.get("max_commits")
+        console.print(
+            f"[yellow]note:[/] hit the {cap}-commit cap for this run"
+            + (f" (--days {days} may cover more)" if days else "")
+            + ". Re-run to continue, or pass [bold]--max-commits 0[/] for no cap."
+        )
 
 
 @app.command()
